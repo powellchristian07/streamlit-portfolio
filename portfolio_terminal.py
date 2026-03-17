@@ -204,7 +204,6 @@ def load_data(path):
     cash     = pd.read_excel(path, sheet_name='Daily_Cash',   index_col=0, parse_dates=True)
     ref      = pd.read_excel(path, sheet_name='Reference_Data')
     trades   = pd.read_excel(path, sheet_name='Trade_Log',    parse_dates=['Date', 'Settlement'])
-    corr_raw = pd.read_excel(path, sheet_name='Correlation',  header=1, index_col=0)
     risk_raw = pd.read_excel(path, sheet_name='Risk_Metrics', header=3)
 
     # Align date indices across all three daily sheets
@@ -222,20 +221,9 @@ def load_data(path):
     cash_s   = cash.iloc[:, 0]
     nav      = cash_s + invested
 
-    # ── TIME-WEIGHTED RETURN (TWR) ──────────────────────────────────────────
-    # External cash flows = daily cash change minus cash impact from trades
-    # Trades: BUY = negative Amount (cash out), SELL = positive Amount (cash in)
-    trades_net  = trades.groupby('Date')['Amount'].sum().reindex(cash_s.index, fill_value=0)
-    cash_change = cash_s.diff().fillna(0)
-    external_cf = (cash_change - trades_net).fillna(0)
-
-    # Sub-period return for each day, adjusting denominator for external flows
-    sub_returns = pd.Series(0.0, index=nav.index)
-    for i in range(1, len(nav)):
-        denom = nav.iloc[i - 1] + external_cf.iloc[i]
-        sub_returns.iloc[i] = (nav.iloc[i] / denom - 1) if denom > 0 else 0.0
-
-    twr_cumulative = (1 + sub_returns).cumprod() - 1
+    # Simple NAV-based daily return and cumulative return
+    sub_returns    = nav.pct_change().fillna(0)
+    twr_cumulative = (nav / nav.iloc[0]) - 1
 
     # Drawdown from rolling NAV peak
     rolling_max = nav.cummax()
@@ -245,19 +233,15 @@ def load_data(path):
         'NAV':          nav,
         'Cash':         cash_s,
         'Invested':     invested,
-        'Daily_Return': sub_returns,      # TWR daily sub-period returns
-        'Cumul_Return': twr_cumulative,   # TWR cumulative
+        'Daily_Return': sub_returns,
+        'Cumul_Return': twr_cumulative,
         'Drawdown':     drawdown,
     })
 
-    # ── CORRELATION MATRIX ─────────────────────────────────────────────────
-    # header=1 loads tickers as column names; drop the 'TICKER / TICKER' index row
-    corr = corr_raw.copy()
-    corr = corr[~corr.index.astype(str).str.contains('TICKER', na=True)]
-    corr = corr.drop(columns=[c for c in corr.columns if 'TICKER' in str(c)], errors='ignore')
-    corr.index = corr.index.astype(str).str.strip()
-    corr.columns = corr.columns.astype(str).str.strip()
-    corr = corr.apply(pd.to_numeric, errors='coerce')
+    # ── CORRELATION MATRIX — recomputed from Market_Data daily returns ──────
+    # Use all tickers present in Market_Data; page_correlation() filters to active only
+    price_returns = market.pct_change().dropna()
+    corr = price_returns.corr().round(4)
 
     # ── RISK METRICS ───────────────────────────────────────────────────────
     risk = risk_raw.dropna(subset=[risk_raw.columns[0]])
@@ -304,25 +288,28 @@ print(f"[OK] Loaded {len(equity_curve)} trading days")
 print(f"[OK] {len(active)} active positions: {active['Ticker'].tolist()}")
 print(f"[OK] Correlation matrix: {corr_filtered.shape}")
 print(f"[OK] NAV: ${current_nav:,.2f}")
-print(f"[OK] TWR Total Return: {total_return:.2%}")
+print(f"[OK] Total Return: {total_return:.2%}")
 print(f"[OK] Sharpe: {sharpe:.2f} | MaxDD: {max_drawdown:.2%}")
 
 # ─────────────────────────────────────────────
 # BENCHMARKS
 # ─────────────────────────────────────────────
-@st.cache_data(ttl=3600)
-def fetch_benchmarks(start, end):
+@st.cache_data(ttl=1800)
+def fetch_benchmarks(start_str: str):
+    from datetime import date as _date
+    end_str = _date.today().strftime('%Y-%m-%d')
     data = {}
     for t in ['VOO', 'QQQ']:
         try:
-            df = yf.download(t, start=start, end=end, auto_adjust=True, progress=False)
+            df = yf.download(t, start=start_str, end=end_str,
+                             auto_adjust=True, progress=False)
             if not df.empty:
                 data[t] = df['Close'].squeeze()
         except Exception:
             pass
     return pd.DataFrame(data) if data else pd.DataFrame()
 
-benchmarks = fetch_benchmarks(start_date, end_date)
+benchmarks = fetch_benchmarks(start_date.strftime('%Y-%m-%d'))
 
 # ─────────────────────────────────────────────
 # SHARED PAGE HEADER
@@ -335,7 +322,7 @@ def page_header():
     PORTFOLIO TERMINAL &nbsp;|&nbsp;
     <span style="color:{TEXT_MUTED}">AS OF</span> {end_date.strftime('%Y-%m-%d')} &nbsp;|&nbsp;
     <span style="color:{TEXT_MUTED}">NAV</span> <span style="color:{POSITIVE}">${current_nav:,.2f}</span> &nbsp;|&nbsp;
-    <span style="color:{TEXT_MUTED}">TWR RETURN</span> <span style="color:{ret_color}">{total_return:+.2%}</span> &nbsp;|&nbsp;
+    <span style="color:{TEXT_MUTED}">TOTAL RETURN</span> <span style="color:{ret_color}">{total_return:+.2%}</span> &nbsp;|&nbsp;
     <span style="color:{TEXT_MUTED}">TODAY</span> <span style="color:{day_color}">{today_return:+.2%}</span>
     </div>
     """, unsafe_allow_html=True)
@@ -365,6 +352,8 @@ with st.sidebar:
         "Correlation",
         "Risk Metrics",
         "Benchmarks",
+        "Kelly Sizing",
+        "Factor Exposure",
         "Trade Log",
     ], label_visibility="collapsed")
 
@@ -419,7 +408,7 @@ def page_dashboard():
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Portfolio NAV",   f"${current_nav:,.2f}")
-    c2.metric("TWR Return",      f"{total_return:+.2%}", delta=f"{today_return:+.2%}")
+    c2.metric("Total Return",    f"{total_return:+.2%}", delta=f"{today_return:+.2%}")
     c3.metric("Today P&L",       f"${today_return * current_nav:,.2f}", delta=f"{today_return:+.2%}")
     c4.metric("Sharpe Ratio",    f"{sharpe:.2f}")
     c5.metric("Max Drawdown",    f"{max_drawdown:.2%}")
@@ -899,6 +888,387 @@ def page_trade_log():
 
 
 # ─────────────────────────────────────────────
+# PAGE 7 — KELLY SIZING
+# ─────────────────────────────────────────────
+def page_kelly():
+    page_header()
+    st.markdown('<div class="bbg-section">POSITION SIZING — KELLY CRITERION MONITOR</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        f'<span style="font-size:10px;font-family:IBM Plex Mono,monospace;color:{TEXT_MUTED}">'
+        f'Kelly fraction computed from Trade_Log win rate and avg win/loss per ticker. '
+        f'Half-Kelly applied as practical sizing limit.</span>',
+        unsafe_allow_html=True,
+    )
+
+    if trades.empty or 'Symbol' not in trades.columns:
+        st.warning("No trade history available.")
+        return
+
+    from collections import deque
+
+    def compute_trade_stats(trade_df, ref_df):
+        stats = {}
+        tickers = trade_df['Symbol'].dropna().unique()
+        for ticker in tickers:
+            t_trades = trade_df[trade_df['Symbol'] == ticker].sort_values('Date')
+            buy_queue = deque()
+            realized  = []
+            for _, row in t_trades.iterrows():
+                action = str(row.get('Action', '')).strip().upper()
+                qty    = abs(float(row.get('Quantity', 0)))
+                price  = abs(float(row.get('Price', 0)))
+                if action == 'BUY':
+                    buy_queue.append([qty, price])
+                elif action == 'SELL' and buy_queue:
+                    remaining_sell = qty
+                    while remaining_sell > 0 and buy_queue:
+                        buy_qty, buy_px = buy_queue[0]
+                        matched = min(remaining_sell, buy_qty)
+                        pnl_pct = (price - buy_px) / buy_px if buy_px > 0 else 0
+                        realized.append(pnl_pct)
+                        buy_queue[0][0] -= matched
+                        remaining_sell  -= matched
+                        if buy_queue[0][0] <= 1e-6:
+                            buy_queue.popleft()
+            if len(realized) < 2:
+                continue
+            wins   = [r for r in realized if r > 0]
+            losses = [r for r in realized if r <= 0]
+            win_rate = len(wins) / len(realized)
+            avg_win  = np.mean(wins)  if wins   else 0.0
+            avg_loss = abs(np.mean(losses)) if losses else 1e-6
+            R = avg_win / avg_loss if avg_loss > 0 else 0
+            kelly_f = win_rate - (1 - win_rate) / R if R > 0 else 0
+            kelly_f = max(kelly_f, 0)
+            stats[ticker] = {
+                'Trades':     len(realized),
+                'Win Rate':   win_rate,
+                'Avg Win':    avg_win,
+                'Avg Loss':   avg_loss,
+                'Kelly':      kelly_f,
+                'Half Kelly': kelly_f / 2,
+            }
+        return stats
+
+    trade_stats = compute_trade_stats(trades, ref)
+
+    last_prices = market.iloc[-1]
+    kelly_rows  = []
+    for _, row in active.iterrows():
+        ticker     = row['Ticker']
+        shares     = row['Cur_Shares']
+        cur_px     = last_prices.get(ticker, 0)
+        mkt_value  = shares * cur_px
+        cur_weight = mkt_value / current_nav if current_nav > 0 else 0
+        if ticker in trade_stats:
+            ts      = trade_stats[ticker]
+            kelly_w = ts['Half Kelly']
+            diff    = cur_weight - kelly_w
+            if cur_weight > kelly_w * 1.25:
+                signal, sig_color = 'REDUCE', NEGATIVE
+            elif cur_weight < kelly_w * 0.75:
+                signal, sig_color = 'ADD', POSITIVE
+            else:
+                signal, sig_color = 'HOLD', AMBER
+            kelly_rows.append({
+                'Ticker':      ticker,
+                'Trades':      ts['Trades'],
+                'Win Rate':    ts['Win Rate'],
+                'Avg Win':     ts['Avg Win'],
+                'Avg Loss':    ts['Avg Loss'],
+                'Full Kelly':  ts['Kelly'],
+                'Half Kelly':  kelly_w,
+                'Current Wt':  cur_weight,
+                'Diff':        diff,
+                'Signal':      signal,
+                '_sig_color':  sig_color,
+            })
+        else:
+            kelly_rows.append({
+                'Ticker':      ticker,
+                'Trades':      0,
+                'Win Rate':    None,
+                'Avg Win':     None,
+                'Avg Loss':    None,
+                'Full Kelly':  None,
+                'Half Kelly':  None,
+                'Current Wt':  cur_weight,
+                'Diff':        None,
+                'Signal':      'NEW',
+                '_sig_color':  TEXT_MUTED,
+            })
+
+    kelly_df = pd.DataFrame(kelly_rows).sort_values('Current Wt', ascending=False)
+
+    reduces = [r for r in kelly_rows if r['Signal'] == 'REDUCE']
+    adds    = [r for r in kelly_rows if r['Signal'] == 'ADD']
+    holds   = [r for r in kelly_rows if r['Signal'] == 'HOLD']
+    news    = [r for r in kelly_rows if r['Signal'] == 'NEW']
+
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc1.metric("REDUCE",           len(reduces))
+    sc2.metric("ADD",              len(adds))
+    sc3.metric("HOLD",             len(holds))
+    sc4.metric("NEW / NO HISTORY", len(news))
+
+    st.markdown('<div class="bbg-section">KELLY SIZING TABLE</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<span style="font-size:10px;font-family:IBM Plex Mono,monospace;color:{TEXT_MUTED}">'
+        f'Half-Kelly is the practical sizing target. '
+        f'REDUCE = current weight > 125% of Half-Kelly. '
+        f'ADD = current weight < 75% of Half-Kelly.</span>',
+        unsafe_allow_html=True,
+    )
+
+    header_style = (f"padding:6px 10px;font-size:10px;text-transform:uppercase;"
+                    f"letter-spacing:1px;color:{TEXT_MUTED};font-family:IBM Plex Sans,sans-serif;"
+                    f"text-align:right")
+    headers = ['Ticker','Trades','Win Rate','Avg Win','Avg Loss',
+               'Full Kelly','Half Kelly','Cur Wt','Diff','Signal']
+
+    def fmt_pct(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return f'<span style="color:#444">—</span>'
+        return f'{v:+.2%}'
+
+    def fmt_pct_plain(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return f'<span style="color:#444">—</span>'
+        return f'{v:.2%}'
+
+    header_row = "".join(f'<th style="{header_style}">{h}</th>' for h in headers)
+    data_rows  = ""
+    for r in kelly_rows:
+        diff_color = NEGATIVE if (r['Diff'] or 0) > 0.01 else (POSITIVE if (r['Diff'] or 0) < -0.01 else TEXT_MUTED)
+        data_rows += (
+            f"<tr style='border-bottom:1px solid {BORDER}'>"
+            f"<td style='padding:5px 10px;font-family:IBM Plex Mono,monospace;font-size:11px;"
+            f"font-weight:600;color:{TEXT_PRIMARY}'>{r['Ticker']}</td>"
+            f"<td style='padding:5px 10px;font-size:11px;text-align:right;color:{TEXT_MUTED}'>{r['Trades']}</td>"
+            f"<td style='padding:5px 10px;font-size:11px;text-align:right'>{fmt_pct_plain(r['Win Rate'])}</td>"
+            f"<td style='padding:5px 10px;font-size:11px;text-align:right;color:{POSITIVE}'>{fmt_pct_plain(r['Avg Win'])}</td>"
+            f"<td style='padding:5px 10px;font-size:11px;text-align:right;color:{NEGATIVE}'>{fmt_pct_plain(r['Avg Loss'])}</td>"
+            f"<td style='padding:5px 10px;font-size:11px;text-align:right;color:{TEXT_MUTED}'>{fmt_pct_plain(r['Full Kelly'])}</td>"
+            f"<td style='padding:5px 10px;font-size:11px;text-align:right;color:{ACCENT_BLUE}'>{fmt_pct_plain(r['Half Kelly'])}</td>"
+            f"<td style='padding:5px 10px;font-size:11px;text-align:right;color:{TEXT_PRIMARY}'>{r['Current Wt']:.2%}</td>"
+            f"<td style='padding:5px 10px;font-size:11px;text-align:right;color:{diff_color}'>{fmt_pct(r['Diff'])}</td>"
+            f"<td style='padding:5px 10px;font-size:11px;text-align:right;"
+            + f"font-weight:600;color:{r['_sig_color']}'>{r['Signal']}</td>"
+            f"</tr>"
+        )
+
+    st.markdown(f"""
+    <div style="overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;background:{BG_SECONDARY};border:1px solid {BORDER}">
+      <thead><tr style="background:{BG_HEADER}">{header_row}</tr></thead>
+      <tbody>{data_rows}</tbody>
+    </table>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="bbg-section">CURRENT WEIGHT VS HALF-KELLY TARGET</div>',
+                unsafe_allow_html=True)
+
+    chart_rows = [r for r in kelly_rows if r['Half Kelly'] is not None]
+    if chart_rows:
+        ch_df = pd.DataFrame(chart_rows).sort_values('Current Wt', ascending=True)
+        fig_k = go.Figure()
+        fig_k.add_trace(go.Bar(
+            y=ch_df['Ticker'], x=ch_df['Current Wt'],
+            name='Current Weight', orientation='h',
+            marker_color=ACCENT_BLUE, opacity=0.9,
+        ))
+        fig_k.add_trace(go.Bar(
+            y=ch_df['Ticker'], x=ch_df['Half Kelly'],
+            name='Half-Kelly Target', orientation='h',
+            marker_color=AMBER, opacity=0.6,
+        ))
+        fig_k.update_layout(
+            **CHART_THEME,
+            title='Current Weight vs Half-Kelly Optimal Weight',
+            xaxis_title='Portfolio Weight',
+            xaxis_tickformat='.1%',
+            barmode='overlay',
+            height=max(250, len(chart_rows) * 32),
+        )
+        st.plotly_chart(fig_k, use_container_width=True)
+
+    st.markdown(
+        f'<div style="font-size:10px;font-family:IBM Plex Mono,monospace;color:{TEXT_MUTED};'
+        f'margin-top:12px;line-height:1.8">'
+        f'Kelly formula: f = W - (1-W)/R &nbsp;|&nbsp; '
+        f'W = win rate &nbsp;|&nbsp; R = avg win / avg loss &nbsp;|&nbsp; '
+        f'Half-Kelly applied to reduce ruin risk. '
+        f'Minimum 2 completed round-trips required for signal.</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ─────────────────────────────────────────────
+# PAGE 8 — FACTOR EXPOSURE
+# ─────────────────────────────────────────────
+def page_factors():
+    page_header()
+    st.markdown('<div class="bbg-section">ROLLING FACTOR EXPOSURE</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        f'<span style="font-size:10px;font-family:IBM Plex Mono,monospace;color:{TEXT_MUTED}">'
+        f'Daily OLS regression of portfolio returns against 5 factors. '
+        f'Rolling 30-day window. Beta = sensitivity of portfolio to each factor.</span>',
+        unsafe_allow_html=True,
+    )
+
+    FACTORS = {
+        'SPY':  ('Market Beta',    TEXT_PRIMARY),
+        'GLD':  ('Gold/Inflation', AMBER),
+        'TLT':  ('Duration/Rates', ACCENT_BLUE),
+        'UUP':  ('USD Strength',   '#A78BFA'),
+        'VIXY': ('Volatility',     NEGATIVE),
+    }
+
+    @st.cache_data(ttl=1800)
+    def fetch_factors(start_str: str):
+        from datetime import date as _date
+        end_str = _date.today().strftime('%Y-%m-%d')
+        result  = {}
+        for ticker in FACTORS:
+            try:
+                df = yf.download(ticker, start=start_str, end=end_str,
+                                 auto_adjust=True, progress=False)
+                if not df.empty:
+                    result[ticker] = df['Close'].squeeze()
+            except Exception:
+                pass
+        return pd.DataFrame(result)
+
+    factor_data = fetch_factors(start_date.strftime('%Y-%m-%d'))
+
+    if factor_data.empty:
+        st.warning("Could not fetch factor data. Check your internet connection.")
+        return
+
+    factor_returns = factor_data.pct_change().dropna()
+    port_returns   = equity_curve['Daily_Return'].dropna()
+    common = port_returns.index.intersection(factor_returns.index)
+
+    if len(common) < 30:
+        st.warning(f"Only {len(common)} common trading days — need at least 30 for rolling regression.")
+        return
+
+    p_ret = port_returns.loc[common]
+    f_ret = factor_returns.loc[common]
+    available_factors = [f for f in FACTORS if f in f_ret.columns]
+
+    if not available_factors:
+        st.warning("None of the factor tickers (SPY, GLD, TLT, UUP, VIXY) could be fetched.")
+        return
+
+    from numpy.linalg import lstsq
+
+    window     = 30
+    roll_betas = {f: [] for f in available_factors}
+    roll_r2    = []
+    roll_dates = []
+
+    for i in range(window, len(p_ret) + 1):
+        y       = p_ret.iloc[i - window:i].values
+        X       = f_ret[available_factors].iloc[i - window:i].values
+        X_const = np.column_stack([np.ones(len(X)), X])
+        try:
+            coeffs, _, _, _ = lstsq(X_const, y, rcond=None)
+            y_hat  = X_const @ coeffs
+            ss_res = np.sum((y - y_hat) ** 2)
+            ss_tot = np.sum((y - y.mean()) ** 2)
+            r2     = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+            for j, f in enumerate(available_factors):
+                roll_betas[f].append(coeffs[j + 1])
+            roll_r2.append(r2)
+            roll_dates.append(p_ret.index[i - 1])
+        except Exception:
+            for f in available_factors:
+                roll_betas[f].append(np.nan)
+            roll_r2.append(np.nan)
+            roll_dates.append(p_ret.index[i - 1])
+
+    st.markdown('<div class="bbg-section">CURRENT FACTOR BETAS (LAST 30 DAYS)</div>',
+                unsafe_allow_html=True)
+
+    beta_cols = st.columns(len(available_factors))
+    for col, f in zip(beta_cols, available_factors):
+        b_val = roll_betas[f][-1] if roll_betas[f] else None
+        if b_val is not None and not np.isnan(b_val):
+            col.metric(FACTORS[f][0], f"{b_val:.3f}")
+        else:
+            col.metric(FACTORS[f][0], "N/A")
+
+    if roll_r2:
+        cur_r2 = roll_r2[-1]
+        fit_label = "good fit" if cur_r2 > 0.7 else ("moderate fit" if cur_r2 > 0.4 else "low fit — idiosyncratic returns dominate")
+        st.markdown(
+            f'<div style="font-size:10px;font-family:IBM Plex Mono,monospace;color:{TEXT_MUTED};'
+            f'margin-bottom:12px">Model R² (last 30d): '
+            f'<span style="color:{TEXT_PRIMARY}">{cur_r2:.3f}</span> — {fit_label}</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown('<div class="bbg-section">ROLLING 30-DAY FACTOR BETAS</div>',
+                unsafe_allow_html=True)
+
+    fig_factors = go.Figure()
+    for f in available_factors:
+        _, color = FACTORS[f]
+        fig_factors.add_trace(go.Scatter(
+            x=roll_dates, y=roll_betas[f],
+            name=FACTORS[f][0],
+            line=dict(color=color, width=1.5),
+            mode='lines',
+        ))
+    fig_factors.add_hline(y=0, line_color=BORDER, line_width=1)
+    fig_factors.update_layout(
+        **CHART_THEME,
+        title='Rolling 30-Day Factor Betas',
+        yaxis_title='Beta',
+        height=380,
+    )
+    st.plotly_chart(fig_factors, use_container_width=True)
+
+    st.markdown('<div class="bbg-section">FACTOR CONTRIBUTION SNAPSHOT</div>',
+                unsafe_allow_html=True)
+
+    snap_betas  = {FACTORS[f][0]: roll_betas[f][-1]
+                   for f in available_factors
+                   if roll_betas[f] and not np.isnan(roll_betas[f][-1])}
+    snap_colors = [FACTORS[f][1] for f in available_factors
+                   if roll_betas[f] and not np.isnan(roll_betas[f][-1])]
+
+    if snap_betas:
+        fig_snap = go.Figure(go.Bar(
+            x=list(snap_betas.keys()),
+            y=list(snap_betas.values()),
+            marker_color=snap_colors,
+        ))
+        fig_snap.add_hline(y=0, line_color=BORDER, line_width=1)
+        fig_snap.update_layout(
+            **CHART_THEME,
+            title='Current Factor Betas (Last 30-Day Window)',
+            yaxis_title='Beta',
+            height=280,
+        )
+        st.plotly_chart(fig_snap, use_container_width=True)
+
+    st.markdown(
+        f'<div style="font-size:10px;font-family:IBM Plex Mono,monospace;color:{TEXT_MUTED};'
+        f'margin-top:8px;line-height:1.8">'
+        f'SPY = market direction &nbsp;|&nbsp; GLD = gold/inflation hedge &nbsp;|&nbsp; '
+        f'TLT = long-duration rates &nbsp;|&nbsp; UUP = USD strength &nbsp;|&nbsp; '
+        f'VIXY = short volatility exposure. '
+        f'Positive beta = portfolio moves with factor. Negative = inverse.</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ─────────────────────────────────────────────
 # ROUTER
 # ─────────────────────────────────────────────
 if page == "Dashboard":
@@ -911,5 +1281,9 @@ elif page == "Risk Metrics":
     page_risk()
 elif page == "Benchmarks":
     page_benchmarks()
+elif page == "Kelly Sizing":
+    page_kelly()
+elif page == "Factor Exposure":
+    page_factors()
 elif page == "Trade Log":
     page_trade_log()
